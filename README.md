@@ -8,6 +8,11 @@ Using the `pydicom` module in Python, this script aggregates the data into a 3D 
 The following Python modules are required, so please make sure to install them in advance.  
 `pydicom` `numpy` `matplotlib` `sys` `glob` `pathlib`
 
+**Note:** 　
+When using a Windows PC, a SyntaxError (unicode error) related to the path can be resolved by adding `r` at the beginning of the path.  
+`NG` path = "C:\Users\myname\Documents\file.txt"  
+`OK` path = r"C:\Users\myname\Documents\file.txt"  
+
 **Method**
 1. Assign the path of the first file in the DICOM data to `path_ct`. Specify the directory to save the generated MPR images in `storage_path`.
 2. Run cells 1 to 3 and take note of the information obtained along the way.
