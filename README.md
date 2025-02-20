@@ -5,7 +5,8 @@ Using the `pydicom` module in Python, this script aggregates the data into a 3D 
 
 **Required Python Modules**  
 
-The following Python modules are required, so please make sure to install them in advance.
+The following Python modules are required, so please make sure to install them in advance.  
+`pydicom` `numpy` `matplotlib` `sys` `glob` `pathlib`
 
 **Method**
 1. Assign the path of the first file in the DICOM data to `path_ct`. Specify the directory to save the generated MPR images in `storage_path`.
