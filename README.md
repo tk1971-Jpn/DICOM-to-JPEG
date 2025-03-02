@@ -8,6 +8,13 @@ Using the `pydicom` module in Python, this script aggregates the data into a 3D 
 The following Python modules are required, so please make sure to install them in advance.  
 `pydicom` `numpy` `matplotlib` `sys` `glob` `pathlib` `ipywidgets`
 
+If `ipywidgets` is not working properly, please run the following script **in the terminal** to enable ipywidgets.<br>
+`jupyter notebook:`  
+jupyter nbextension enable --py widgetsnbextension  
+`jupyter lab:`<br>
+jupyter labextension install @jupyter-widgets/jupyterlab-manager
+
+
 **Note:** 　
 When using a Windows PC, a SyntaxError (unicode error) related to the path can be resolved by adding `r` at the beginning of the path.  
 `NG` path = "C:\Users\myname\Documents\file.txt"  
