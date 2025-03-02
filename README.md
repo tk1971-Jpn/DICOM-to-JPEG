@@ -6,7 +6,7 @@ Using the `pydicom` module in Python, this script aggregates the data into a 3D 
 **Required Python Modules**  
 
 The following Python modules are required, so please make sure to install them in advance.  
-`pydicom` `numpy` `matplotlib` `sys` `glob` `pathlib``ipywidgets`
+`pydicom` `numpy` `matplotlib` `sys` `glob` `pathlib` `ipywidgets`
 
 **Note:** 　
 When using a Windows PC, a SyntaxError (unicode error) related to the path can be resolved by adding `r` at the beginning of the path.  
