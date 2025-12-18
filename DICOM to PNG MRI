@@ -1,0 +1,303 @@
+from pathlib import Path
+import numpy as np, pydicom, csv
+from pydicom.pixel_data_handlers.util import apply_modality_lut, apply_voi_lut
+from PIL import Image
+from scipy.ndimage import zoom  # 等方リサンプリング用（線形補間）
+
+
+# ====== ここだけご自身の環境に合わせてください ======
+SRC_DIR = '/Users/tkimura/Desktop/Image data/1113640HCC/Dynamic2.5MRI'   # DICOMのフォルダ
+OUT_DIR = '/Users/tkimura/Desktop/Image data/1113640HCC/Dynamic2.5MRIPNG' # 出力先フォルダ
+FMT     = "png"     # "png" または "jpg"
+
+# WL/WW：MRIでは絶対値が意味を持たないことも多いので AUTO=True 推奨（必要ならFalseで手動）
+WL, WW  = 40, 400
+AUTO    = True      # True: 自動WL/WW(0.5〜99.5%)
+
+# 等方化（mm）。None の場合は "元の px,py,pz の最小値" を採用
+ISO_SPACING_MM = None
+
+INTERP_ORDER   = 1   # 0=ニアレスト, 1=線形, 3=3次
+SAVE_AXIAL    = True
+SAVE_CORONAL  = True
+SAVE_SAGITTAL = True
+
+# 必要に応じて見た目調整（左右/上下の反転）
+FLIP_AXIAL_LR = False; FLIP_AXIAL_UD = False
+FLIP_COR_LR   = False; FLIP_COR_UD   = False
+FLIP_SAG_LR   = False; FLIP_SAG_UD   = False
+# ================================================
+
+
+src = Path(SRC_DIR)
+out_root = Path(OUT_DIR)
+out_root.mkdir(parents=True, exist_ok=True)
+
+def _is_dicom(p: Path):
+    try:
+        with open(p, "rb") as f:
+            pre = f.read(132)
+            return pre[128:132] == b"DICM"
+    except Exception:
+        return False
+
+def _get_series_key(ds):
+    return (getattr(ds, "StudyInstanceUID", None), getattr(ds, "SeriesInstanceUID", None))
+
+def _get_pixel_spacing_xy(ds):
+    """
+    DICOM PixelSpacing = (RowSpacing, ColumnSpacing) = (Y, X)
+    """
+    px = py = 1.0
+    ps = getattr(ds, "PixelSpacing", None)
+    if ps is not None and len(ps) >= 2:
+        try:
+            py = float(ps[0])  # row spacing (Y)
+            px = float(ps[1])  # col spacing (X)
+        except Exception:
+            px = py = 1.0
+    return float(px), float(py)
+
+def _get_normal_from_iop(ds):
+    """
+    ImageOrientationPatient からスライス法線ベクトルを計算
+    iop = [row_x,row_y,row_z, col_x,col_y,col_z]
+    normal = row × col
+    """
+    iop = getattr(ds, "ImageOrientationPatient", None)
+    if iop is None or len(iop) < 6:
+        return None
+    try:
+        row = np.array(list(map(float, iop[:3])), dtype=np.float64)
+        col = np.array(list(map(float, iop[3:6])), dtype=np.float64)
+        n = np.cross(row, col)
+        norm = np.linalg.norm(n)
+        if norm < 1e-9:
+            return None
+        return (n / norm).astype(np.float64)
+    except Exception:
+        return None
+
+def _get_slice_position_along_normal(ds, normal):
+    """
+    ImagePositionPatient をスライス法線方向に射影した値（ソート用）
+    """
+    ipp = getattr(ds, "ImagePositionPatient", None)
+    if ipp is None or len(ipp) < 3 or normal is None:
+        return None
+    try:
+        ipp = np.array(list(map(float, ipp[:3])), dtype=np.float64)
+        return float(np.dot(ipp, normal))
+    except Exception:
+        return None
+
+def _estimate_pz_from_positions(positions):
+    """
+    positions: 法線方向射影値の配列（ソート済みでなくても良い）
+    Dynamicなどで同一位置が混ざる場合は0差分が多いので除外して中央値を返す
+    """
+    pos = np.array([p for p in positions if p is not None], dtype=np.float64)
+    if pos.size < 2:
+        return None
+    pos.sort()
+    diffs = np.diff(pos)
+    diffs = np.abs(diffs)
+    diffs = diffs[diffs > 1e-6]  # 0（同一位置）を除外
+    if diffs.size == 0:
+        return None
+    return float(np.median(diffs))
+
+def _fallback_pz(ds):
+    """
+    どうしても推定できない場合のフォールバック
+    """
+    pz = getattr(ds, "SpacingBetweenSlices", None)
+    if pz is not None:
+        try:
+            return float(pz)
+        except Exception:
+            pass
+    try:
+        return float(getattr(ds, "SliceThickness"))
+    except Exception:
+        return None
+
+def _save_stack(stack3d, out_dir: Path, flip_lr=False, flip_ud=False):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    num_width = max(3, len(str(stack3d.shape[0])))
+    for i, slice2d in enumerate(stack3d, start=1):  # 001始まり
+        img = (slice2d * 255.0 + 0.5).astype(np.uint8)
+        if flip_lr: img = np.fliplr(img)
+        if flip_ud: img = np.flipud(img)
+        fname = f"{i:0{num_width}d}"
+        if FMT.lower() in ("jpg", "jpeg"):
+            Image.fromarray(img, mode="L").save(out_dir / f"{fname}.jpg", quality=95, subsampling=0)
+        else:
+            Image.fromarray(img, mode="L").save(out_dir / f"{fname}.png")
+
+
+# =========================================================
+# 1) DICOM収集 & 最大スライスのシリーズを選択
+# =========================================================
+series = {}
+for p in src.rglob("*"):
+    if p.is_file() and _is_dicom(p):
+        try:
+            ds = pydicom.dcmread(str(p), stop_before_pixels=True, force=True)
+            key = _get_series_key(ds)
+            if key[1]:
+                series.setdefault(key, []).append(p)
+        except Exception:
+            pass
+
+if not series:
+    raise RuntimeError(f"No DICOM series found under: {src}")
+
+key = max(series, key=lambda k: len(series[k]))
+files = series[key]
+
+
+# =========================================================
+# 2) 並び順：斜位対応（IOP法線＋IPP射影）でソート
+#    IOPが無い場合のみ InstanceNumber へフォールバック
+# =========================================================
+# 代表の1枚から法線を取得（シリーズ内で同一のはず）
+ds_ref = pydicom.dcmread(str(files[0]), stop_before_pixels=True, force=True)
+normal = _get_normal_from_iop(ds_ref)
+
+metas = []
+positions = []
+for p in files:
+    ds = pydicom.dcmread(str(p), stop_before_pixels=True, force=True)
+    inst = int(getattr(ds, "InstanceNumber", 0))
+    pos = _get_slice_position_along_normal(ds, normal)
+    positions.append(pos)
+    metas.append((p, pos, inst))
+
+if any(m[1] is not None for m in metas):
+    # pos=None は最後へ
+    metas.sort(key=lambda x: (x[1] is None, x[1]))
+else:
+    metas.sort(key=lambda x: x[2])
+
+files = [m[0] for m in metas]
+positions_sorted = [m[1] for m in metas]
+
+
+# =========================================================
+# 3) スペーシング取得（px,pyはPixelSpacing、pzはIPP差分から推定）
+# =========================================================
+ds0 = pydicom.dcmread(str(files[0]), force=True)
+px, py = _get_pixel_spacing_xy(ds0)   # mm (X,Y)
+
+pz = _estimate_pz_from_positions(positions_sorted)
+if pz is None:
+    pz = _fallback_pz(ds0)
+if pz is None:
+    # 最終手段：in-planeに合わせる
+    pz = min(px, py)
+
+Y, X = int(ds0.Rows), int(ds0.Columns)
+Z = len(files)
+
+
+# =========================================================
+# 4) 読み込み（モダリティLUT適用、必要に応じVOI LUT）
+# =========================================================
+vol = np.zeros((Z, Y, X), dtype=np.float32)
+
+for i, p in enumerate(files):
+    ds = pydicom.dcmread(str(p), force=True)
+    arr = ds.pixel_array
+
+    # CT: modality LUTでHU相当に / MRI: そのままfloat化（modality LUTがある場合のみ適用）
+    try:
+        arr = apply_modality_lut(arr, ds)
+    except Exception:
+        arr = arr.astype(np.float32)
+    else:
+        arr = arr.astype(np.float32)
+
+    # VOI LUT は「表示用」要素なので、AUTO時の補助としてのみ適用
+    if AUTO:
+        try:
+            arr = apply_voi_lut(arr, ds).astype(np.float32)
+        except Exception:
+            pass
+
+    vol[i] = arr
+
+
+# =========================================================
+# 5) 等方化（Z,Y,X の順にスケール指定）
+# =========================================================
+if ISO_SPACING_MM is None:
+    iso = min(px, py, pz)
+else:
+    iso = float(ISO_SPACING_MM)
+
+# new_dim = old_dim * (old_spacing / new_spacing)
+fz = pz / iso
+fy = py / iso
+fx = px / iso
+
+newZ = max(1, int(round(Z * fz)))
+newY = max(1, int(round(Y * fy)))
+newX = max(1, int(round(X * fx)))
+
+vol_iso = zoom(vol, zoom=(fz, fy, fx), order=INTERP_ORDER, mode='nearest', grid_mode=True)
+
+# zoomの端誤差対策：整数サイズへ
+vol_iso = vol_iso[:newZ, :newY, :newX]
+
+
+# =========================================================
+# 6) 0-1正規化（WL/WW or 自動percentile）
+# =========================================================
+if AUTO or WL is None or WW is None:
+    Z2, Y2, X2 = vol_iso.shape
+    samp = vol_iso[::max(Z2//16,1), ::max(Y2//16,1), ::max(X2//16,1)].ravel()
+    vmin, vmax = np.percentile(samp, 0.5), np.percentile(samp, 99.5)
+else:
+    vmin, vmax = WL - WW/2.0, WL + WW/2.0
+
+vol01 = np.clip((vol_iso - vmin) / max(1e-6, (vmax - vmin)), 0.0, 1.0)
+
+
+# =========================================================
+# 7) 3面出力
+# =========================================================
+if SAVE_AXIAL:
+    _save_stack(vol01, out_root / "axial", flip_lr=FLIP_AXIAL_LR, flip_ud=FLIP_AXIAL_UD)
+
+if SAVE_CORONAL:
+    # (Z,Y,X) -> (Y,Z,X) ：stack3dの先頭次元が枚数
+    cor = np.transpose(vol01, (1, 0, 2))
+    _save_stack(cor, out_root / "coronal", flip_lr=FLIP_COR_LR, flip_ud=FLIP_COR_UD)
+
+if SAVE_SAGITTAL:
+    # (Z,Y,X) -> (X,Z,Y)
+    sag = np.transpose(vol01, (2, 0, 1))
+    _save_stack(sag, out_root / "sagittal", flip_lr=FLIP_SAG_LR, flip_ud=FLIP_SAG_UD)
+
+
+# =========================================================
+# 8) メタデータ（Blender/UE の配置用）
+# =========================================================
+with open(out_root / "metadata.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["SeriesInstanceUID", key[1]])
+    w.writerow(["Original_Shape_ZYX", Z, Y, X])
+    w.writerow(["Original_Spacing_mm_XYZ", px, py, pz])
+    w.writerow(["Isotropic_Spacing_mm", iso])
+    Z2, Y2, X2 = vol01.shape
+    w.writerow(["Isotropic_Shape_ZYX", Z2, Y2, X2])
+    w.writerow(["Axial_pixel_mm_(H,W)_&slice_step_mm",   (iso, iso), iso])
+    w.writerow(["Coronal_pixel_mm_(H,W)_&slice_step_mm", (iso, iso), iso])
+    w.writerow(["Sagittal_pixel_mm_(H,W)_&slice_step_mm",(iso, iso), iso])
+
+print("✅ Done.")
+print("Series:", key[1])
+print("Original  (Z,Y,X):", (Z, Y, X), "Spacing(mm XYZ):", (px, py, pz))
+print("Isotropic (Z,Y,X):", vol01.shape, "Spacing(mm):", iso)
+print("Saved to:", str(out_root))
